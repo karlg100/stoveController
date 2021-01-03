@@ -1,30 +1,32 @@
-// This #include statement was automatically added by the Particle IDE.
+
 #include "DallasTemperature.h"
-
-// This #include statement was automatically added by the Particle IDE.
 #include <Debounce.h>
-
-// This #include statement was automatically added by the Particle IDE.
 #include <pid.h>
-
-// This #include statement was automatically added by the Particle IDE.
 #include <OneWire.h>
 
 // Thermocouple
-//OneWire oneWire(D3);
-//DallasTemperature dallas(&oneWire);
 DallasTemperature dallas(new OneWire(D3));
 DeviceAddress addr;
 
 // anything less than this temp is invalid.  set to the lowest possible temp for the environemnt
 #define MIN_TEMP 0
-#define MAX_TEMP 512
+
+// Max temp.  We should chirp when we get this high
+#define MAX_TEMP 500
+
+// Max temp.  Start freaking out if we go above this
+#define MAX_TEMP_PANIC 600
+
 #define TEMP_OUT_OF_RANGE 500
+
+// temperture when we should start flashing for coal
+#define TEMP_NEED_COAL 200
 
 //  number of bad readings in a row to be considered out of range and go to safe mode
 #define BAD_READING_LIMIT 10
 int badReadings = 0;
 
+// Button
 #define BUTTON A4
 #define BUTTON_OVERRIDE_DURATION 60000
 #define BUTTON_OVERRIDE_MAX 600000
@@ -33,61 +35,77 @@ size_t buttonOverrideTimer = 0;
 size_t buttonPressTimer = 0;
 Debounce buttonDebouncer = Debounce();
 
-// LED Pin
+// LED
 #define LED A0
 
-// Speaker Pin
+// Speaker
 #define BUZZER A1
+#define ALARM_SLEEP 60000;
+#define ALARM_SLEEP_PANIC 30000;
+
+#define ALARM_NONE 0
+#define ALARM_WARN 1
+#define ALARM_PANIC 2
+
+bool alarmMute = false;
+int alarmStage = 0;
+size_t nextAlarm = 0;
+
 
 // Actuator control and params
 Servo myservo;
 #define SERVO_PIN D2
+
+// Absolute min and max range of the servo
 //define SERVO_MIN 1050
 //define SERVO_MAX 2000
 
 // min/max for the coal stove
 
-// Viglant II
-#define SERVO_MIN 1200
+// Viglant II - manual
+//define SERVO_MIN 1200
+//define SERVO_MAX 1700
+
+// Viglant II - auto (with coal)
+#define SERVO_MIN 1400
 #define SERVO_MAX 1700
-//define SERVO_MAX 1500
+
 
 // Serdiac settins
 //define SERVO_MIN 1220
 //define SERVO_MAX 1420
 
-
-// step size for each time we adust the servo
-#define STEP_SIZE 20
-
-// temp swing + or - the set temp to start adjusting the servo
-#define TEMP_SWING 1
-
-// sleep time between doing a step in or out when trying to reach out setpoint
-#define STEP_SLEEP 60000
-
+// Timing
 // sleep time between publishing telementry
 #define TELEM_SLEEP 8000
 
-// Servo Control
+// Defaults for configuation
 #define DEFAULT_SERVO SERVO_MAX
 //define DEFAULT_SERVO (SERVO_MIN+SERVO_MAX)/2
 #define DEFAULT_TARGETTEMP 200
 #define DEFAULT_MODE 0
 
-#define MODE_AUTO 0
-#define MODE_MANUAL 1
+// Modes
+// Manual - do nothing, servo is set manually using remote fuctions
+// Auto - adjust the servo/output of the stove as set by the remote thermostat (it does all the thinking)
+// Auto_PID - set a target temp for the stove, and try to keep it there
+#define MODE_MANUAL 0
+#define MODE_AUTO 1
+#define MODE_AUTO_PID 2
+
+#define MODE_MIN MODE_MANUAL
+#define MODE_MAX MODE_AUTO_PID
 
 // time tracking vars
 size_t lastReport = 0;
-size_t lastStep = 0;
 
 // for particle cloud vars
 double tempC = 0.0;
 double tempF = 0.0;
-double servo = 0.0;
 char outstr[30];
 double c, f;
+double modeOutput;      // Output to Servo, depending on mode
+double targetTemp = DEFAULT_TARGETTEMP;
 
 // PID setup
 //Define Variables we'll be connecting to
@@ -105,16 +123,13 @@ PID myPID(&Input, &Output, &Setpoint, consKp, consKi, consKd, PID::DIRECT);
 // EEPROM state struct and handlers
 // Struct for storing state in RAM and EEPROM
 struct CCState {
-    int magicNumber = 0xC10001; // this should change when struct changes
+    int magicNumber = 0xC10003; // this should change when struct changes
 
     // Servo Control
     int servoState;
 
     // Servo Control
     int mode;
-
-    // Target temp to maintain output at
-    int targetTemp;
 
     // checkum value
     int checkSum = 0;
@@ -125,8 +140,8 @@ struct CCState {
 #define CFG_BASE 0
 bool readCfg()
 {
-  uint8_t *_data = (uint8_t*) &cfgData;
   //uint8_t* _data     = &cfgData;
+  uint8_t *_data = (uint8_t*) &cfgData;
   int      _chkSum   = 0;
 
   for (int i = 0; i < sizeof(cfgData); i++)
@@ -157,11 +172,7 @@ int writeCfg()
 bool validCfg() {
     if ( cfgData.servoState < SERVO_MIN || cfgData.servoState > SERVO_MAX )
         return false;
-    if (cfgData.targetTemp < MIN_TEMP)
-        return false;
-    if (cfgData.targetTemp > MAX_TEMP)
-        return false;
-    if (cfgData.mode < MODE_AUTO || cfgData.mode > MODE_MANUAL)
+    if (cfgData.mode < MODE_MIN || cfgData.mode > MODE_MAX)
         return false;
 
     // everything looks good!  We can use these values
@@ -170,16 +181,12 @@ bool validCfg() {
 
 int initCfg() {
     cfgData.servoState = DEFAULT_SERVO;
-    cfgData.targetTemp = DEFAULT_TARGETTEMP;
     cfgData.mode = DEFAULT_MODE;
     writeCfg();
     Particle.publish("EEPROM", "New state initialized and written");
 }
 
-void setup() {
-    // init servo
-    myservo.attach(SERVO_PIN);   // attach the servo on the D0 pin to the servo object
-
+void setupCfg() {
     // retrieve values from EEPROM or init if needed
     if ( !readCfg() ) {
         Particle.publish("EEPROM", "State failed checksum from EEPROM");
@@ -191,26 +198,67 @@ void setup() {
         initCfg();
     } else
         Particle.publish("EEPROM", "State has valid values");
+}
+
+void LEDFlash(int duration) {
+    digitalWrite(LED, HIGH);
+    delay(duration);
+    digitalWrite(LED, LOW);
+}
+
+void LEDhandler() {
+    if (alarmStage == ALARM_WARN && !alarmMute) {
+        LEDFlash(20);
+        return;
+    }
+    
+    if (alarmStage == ALARM_PANIC && !alarmMute) {
+        LEDFlash(50);    delay(100);
+        LEDFlash(50);    delay(100);
+        LEDFlash(50);    delay(300);
+        LEDFlash(100);    delay(100);
+        LEDFlash(100);    delay(100);
+        LEDFlash(100);    delay(300);
+        LEDFlash(50);    delay(100);
+        LEDFlash(50);    delay(100);
+        LEDFlash(50);    delay(100);
+        return;
+    }
+    
+    if (f < TEMP_NEED_COAL) {
+        digitalWrite(LED, LOW);
+        delay(200);
+        analogWrite(LED, 50);
+    } else {
+        digitalWrite(LED, LOW);
+    }
+}
+
+Timer LEDTimer(5000, LEDhandler);
+
+void setup() {
+    // init servo
+    myservo.attach(SERVO_PIN);   // attach the servo on the D0 pin to the servo object
+
+    setupCfg();
 
     myservo.writeMicroseconds(cfgData.servoState);    // test the servo by moving it to 25°
-    servo = cfgData.servoState;
-    lastStep = millis();
     lastReport = millis();
-    delay(1000);
-    
+
     // init sensor
     dallas.begin();
-    dallas.setResolution(12);
+    dallas.setResolution(10);  // Hack - we're really reading 12 bit, but we're turning down the coversion time with the MAX31850
     
     // Register a Particle variable here
     Particle.variable("C", &c, DOUBLE);
     Particle.variable("F", &f, DOUBLE);
     Particle.variable("Input", &Input, DOUBLE);
     Particle.variable("Output", &Output, DOUBLE);
-    Particle.variable("cfgData.servoState", &cfgData.servoState, INT);
+    Particle.variable("Mode", &cfgData.mode, INT);
+    Particle.variable("servoState", &cfgData.servoState, INT);
+    Particle.variable("targetTemp", &targetTemp, DOUBLE);
 
-    //Mesh.subscribe("CoalSetPt", partileSetTargetTemp);
-    Particle.subscribe("StoveTargetTemp", partileSetTargetTemp);
+    Particle.subscribe("StoveTargetTemp", particleSetTargetTemp);
 
     Particle.function("stepOut", servoOut);
     Particle.function("stepIn", servoIn);
@@ -225,7 +273,7 @@ void setup() {
     // PID setup
     //initialize the variables we're linked to
     Input = (double)f;
-    Setpoint = (double)cfgData.targetTemp;
+    Setpoint = targetTemp;
 
     myPID.SetOutputLimits(0, 100);
     //myPID.SetOutputLimits(SERVO_MIN, SERVO_MAX);
@@ -242,6 +290,7 @@ void setup() {
     // setup LED
     pinMode(LED, OUTPUT);  // set D7 as an output so we can flash the onboard LED
     digitalWrite(LED, LOW);
+    LEDTimer.start();
 
     // setup Speaker
     pinMode(BUZZER, OUTPUT);  // set D7 as an output so we can flash the onboard LED
@@ -251,77 +300,63 @@ void setup() {
 int servoOut(String stepValue) {
     if ( cfgData.servoState + stepValue.toInt() <= SERVO_MAX )
         cfgData.servoState += stepValue.toInt();
+    writeCfg();
     return cfgData.servoState;
 }
 
 int servoIn(String stepValue) {
     if ( cfgData.servoState - stepValue.toInt() >= SERVO_MIN )
         cfgData.servoState -= stepValue.toInt();
+    writeCfg();
     return cfgData.servoState;
 }
 
 int setMode(String mode) {
-    if (mode.toInt() >= MODE_AUTO && mode.toInt() <= MODE_MANUAL)
+    if (mode.toInt() >= MODE_MIN && mode.toInt() <= MODE_MAX)
         cfgData.mode = mode.toInt();
     writeCfg();
     return cfgData.mode;
 }
 
-
 int setTargetTemp(String tempValue) {
-    cfgData.targetTemp = tempValue.toInt();
-    //writeCfg();
-    return cfgData.targetTemp;
+    targetTemp = (double)tempValue.toFloat();
+    return targetTemp;
 }
 
-void partileSetTargetTemp(const char *event, const char *data)
+void particleSetTargetTemp(const char *event, const char *data)
 {
     setTargetTemp(data);
-//    Particle.publish("newSetPt", String(cfgData.targetTemp));
 }
 
 void buttonPress() {
-    if (buttonOverrideTimer < millis())
-        buttonOverrideTimer = millis();
-    if (buttonOverrideTimer-millis()+BUTTON_OVERRIDE_DURATION > BUTTON_OVERRIDE_MAX)
+    if (alarmStage > ALARM_NONE && !alarmMute) {
+        alarmMute = true;
         return;
+    }
+    
     buttonOverrideTimer += buttonOverrideTimer + BUTTON_OVERRIDE_DURATION;
 }
 
 // calculate new servo position
 void checkTemp() {
-    // Output is a range of 0-100%
+    if (lastReport + TELEM_SLEEP > millis())
+        return;
     
-    // inverse control - 100% is SERVO_MIN, 0% is SERVO_MAX
+    // Output is a range of 0-100%
+        // inverse control - 100% is SERVO_MIN, 0% is SERVO_MAX
     //cfgData.servoState = SERVO_MIN + round((SERVO_MAX - SERVO_MIN) * ((100 - Output)/100));
+
+    // Decide witch output to use
+    if (cfgData.mode == MODE_AUTO_PID)      // Second PID Control
+        modeOutput = double(Output);
+    else if (cfgData.mode == MODE_AUTO)     // Direct Control
+        modeOutput = targetTemp;
 
     // direct control - 100% is SERVO_MAX, 0% is SERVO_MIN
     if (buttonOverrideTimer > millis())
         cfgData.servoState = SERVO_MAX;
-    else if (cfgData.mode == MODE_AUTO)
-        cfgData.servoState = SERVO_MIN + round((SERVO_MAX - SERVO_MIN) * (Output/100));
-
-/*
-    // check to see if we're still sleeping
-    if (lastStep + STEP_SLEEP > millis())
-        return;
-      
-    if (f < MIN_TEMP)
-        return;
-      
-    // check for temp too low, if so, step in to open damper
-    if (f < cfgData.targetTemp-TEMP_SWING && cfgData.servoState - STEP_SIZE >= SERVO_MIN ) {
-        cfgData.servoState -= STEP_SIZE;
-        Particle.publish("status", "temp too low, stepping in");
-        lastStep = millis();
-    }
-    // cehck for temp too high, if so, step out to close door
-    else if ( f > cfgData.targetTemp+TEMP_SWING && cfgData.servoState + STEP_SIZE <= SERVO_MAX ) {
-        cfgData.servoState += STEP_SIZE;
-        Particle.publish("status", "temp too high, stepping out");
-        lastStep = millis();
-    }
-    */
+    else if (cfgData.mode == MODE_AUTO || cfgData.mode == MODE_AUTO_PID)     // Direct Control
+        cfgData.servoState = SERVO_MIN + round((SERVO_MAX - SERVO_MIN) * (modeOutput/100));
 }
 
 // get telementry from probe and feed it to the PID
@@ -331,13 +366,13 @@ void getTelem() {
     digitalWrite(D7, HIGH);
     dallas.requestTemperatures();
     digitalWrite(D7, LOW);
-    delay(1000);
+//    delay(1000);
     c = dallas.getTempCByIndex(0);
 
-    digitalWrite(D7, HIGH);
-    dallas.requestTemperatures();
-    digitalWrite(D7, LOW);
-    delay(1000);
+//    digitalWrite(D7, HIGH);
+//    dallas.requestTemperatures();
+//    digitalWrite(D7, LOW);
+//    delay(1000);
     float fTemp = dallas.getTempFByIndex(0);
 
    // PID routine
@@ -356,7 +391,7 @@ void getTelem() {
 
     Input = (double)f;
 
-    Setpoint = (double)cfgData.targetTemp;
+    Setpoint = targetTemp;
 
 /*
     double gap = abs(Setpoint-Input); //distance away from setpoint
@@ -374,6 +409,8 @@ void getTelem() {
 
     // compute new PID value
     myPID.Compute();
+    
+    checkTemp();
 }
 
 void publishTelem() {
@@ -387,25 +424,23 @@ void publishTelem() {
 
     // publish Ferenheight
     if (f > 0) {
-        //sprintf(outstr,"%f", f);
         //Particle.publish("C", String(c));
         Particle.publish("F", String(f));
-        //Mesh.publish("F", outstr);
     }
 
     // publish current temperature setpoint
-    //sprintf(outstr,"%d", cfgData.targetTemp);
-    Particle.publish("targetTemp", String(cfgData.targetTemp));
+    if (cfgData.mode == MODE_AUTO_PID)
+        Particle.publish("targetTemp", String(targetTemp));
 
-    //sprintf(outstr,"%f", Output);
-    Particle.publish("PID", String(Output));
+    Particle.publish("PID", String(modeOutput));
+
+//    Particle.publish("Debug", String(Output)+", "+String(targetTemp)+", "+String(modeOutput));
 
     // adjust servo
     sprintf(outstr,"%d / %d", cfgData.servoState, myservo.read());
     Particle.publish("servo", outstr);
 
     if (buttonOverrideTimer > millis()) {
-        //sprintf(outstr,"%d", buttonOverrideTimer-millis());
         Particle.publish("Override", String(buttonOverrideTimer-millis()));
     } else if (buttonOverrideTimer > 0)
         buttonOverrideTimer = 0;
@@ -417,6 +452,69 @@ void publishTelem() {
 void setServo() {
     myservo.writeMicroseconds(cfgData.servoState);
 }
+
+void soundAlarm1() {
+    Particle.publish("Alarm", "Alarm1");
+    digitalWrite(BUZZER, HIGH);
+    delay(10);
+    digitalWrite(BUZZER, LOW);
+    delay(500);
+    digitalWrite(BUZZER, HIGH);
+    delay(30);
+    digitalWrite(BUZZER, LOW);
+//    delay(100);
+//    digitalWrite(BUZZER, HIGH);
+//    delay(10);
+//    digitalWrite(BUZZER, LOW);
+}
+
+void soundAlarm2() {
+    Particle.publish("Alarm", "Alarm2");
+    for (int x = 0; x <= 255; x++) {
+        analogWrite(BUZZER, x);
+        delay(5);
+    }    
+    analogWrite(BUZZER, 0);
+}
+
+
+void checkAlarms() {
+    // If our temp dropped below threadhold, downgrade and reset
+    if (f < MAX_TEMP && alarmStage == ALARM_WARN) {
+        alarmStage = ALARM_NONE;
+        alarmMute = false;
+        nextAlarm = 0;
+    }
+    else if (f < MAX_TEMP_PANIC && alarmStage == ALARM_PANIC) {
+        alarmStage = ALARM_WARN;
+    }
+
+    // Check if our temp is above threadhold, and upgrade
+    if (f > MAX_TEMP_PANIC*1.01 && alarmStage < ALARM_PANIC) {
+        alarmStage = ALARM_PANIC;
+        nextAlarm = 0;
+        alarmMute = false;
+    } 
+    else if (f > MAX_TEMP*1.01 && alarmStage < ALARM_WARN) {
+        alarmStage = ALARM_WARN;
+        alarmMute = false;
+        nextAlarm = 0;
+    }
+
+    // sound the alarm!
+    if (alarmStage > ALARM_NONE && nextAlarm < millis() && !alarmMute) {
+        if (alarmStage == ALARM_WARN) {
+            if (!alarmMute) soundAlarm1();
+            nextAlarm = millis() + ALARM_SLEEP;
+        }       
+        
+        else if (alarmStage == ALARM_PANIC) {
+            if (!alarmMute) soundAlarm2();
+            nextAlarm = millis() + ALARM_SLEEP_PANIC;
+        }
+    }
+}
+
 
 void loop() {
     // service Button
@@ -434,13 +532,14 @@ void loop() {
     getTelem();
 
     // check temp, adjust servo
-    checkTemp();
+    //checkTemp();
 
     // update the servo
     setServo();
 
     // publish telementry
     publishTelem();
+    
+    // sound the alarms
+    checkAlarms();
 }
-
-
